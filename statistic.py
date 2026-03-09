@@ -1689,7 +1689,30 @@ TESTS = {
 }
 
 # ==================== СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЕЙ ====================
-user_state = {}  # chat_id -> {'mode': 'test'|'study', 'topic': str, 'q_idx': int, 'score': int, 'questions': list}
+# chat_id -> {
+#   'mode': 'test'|'study'|'idle',
+#   'topic': str, 'topic_name': str,
+#   'q_idx': int, 'score': int, 'questions': list, 'total': int,
+#   'last_q_msg_id': int,       # id сообщения с вопросом (для удаления)
+#   'last_ans_msg_id': int,     # id сообщения с ответом (для удаления)
+#   'completed_topics': set,    # пройденные темы (≥60%)
+#   'results': list
+# }
+user_state = {}
+
+def get_state(chat_id):
+    if chat_id not in user_state:
+        user_state[chat_id] = {'completed_topics': set(), 'results': []}
+    return user_state[chat_id]
+
+def safe_delete(chat_id, msg_id):
+    """Удаляет сообщение, игнорируя ошибки (уже удалено / нет прав)."""
+    if not msg_id:
+        return
+    try:
+        bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass
 
 # ==================== КЛАВИАТУРЫ ====================
 
@@ -1704,15 +1727,14 @@ def main_menu_keyboard():
     )
     return markup
 
-def topics_keyboard(prefix="study"):
+def topics_keyboard(prefix="study", completed=None):
+    """Клавиатура тем. Пройденные темы помечаются ✅."""
+    if completed is None:
+        completed = set()
     markup = types.InlineKeyboardMarkup(row_width=1)
     for key, name in TOPICS.items():
-        markup.add(types.InlineKeyboardButton(name, callback_data=f"{prefix}:{key}"))
-    return markup
-
-def back_keyboard():
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
+        label = f"✅ {name}" if key in completed else name
+        markup.add(types.InlineKeyboardButton(label, callback_data=f"{prefix}:{key}"))
     return markup
 
 def after_study_keyboard(topic_key):
@@ -1728,7 +1750,13 @@ def after_study_keyboard(topic_key):
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    user_state[message.chat.id] = {}
+    chat_id = message.chat.id
+    # Сохраняем прогресс при рестарте
+    existing = user_state.get(chat_id, {})
+    user_state[chat_id] = {
+        'completed_topics': existing.get('completed_topics', set()),
+        'results': existing.get('results', []),
+    }
     bot.send_message(
         message.chat.id,
         "🎓 *Добро пожаловать в бот подготовки по Статистике!*\n\n"
@@ -1762,12 +1790,16 @@ def handle_text(message):
     text = message.text
 
     if text == "📚 Изучить тему":
+        state = get_state(chat_id)
         bot.send_message(chat_id, "📚 *Выбери тему для изучения:*",
-                         parse_mode="Markdown", reply_markup=topics_keyboard("study"))
+                         parse_mode="Markdown",
+                         reply_markup=topics_keyboard("study", state.get('completed_topics', set())))
 
     elif text == "🧪 Пройти тест":
+        state = get_state(chat_id)
         bot.send_message(chat_id, "🧪 *Выбери тему для теста:*",
-                         parse_mode="Markdown", reply_markup=topics_keyboard("test"))
+                         parse_mode="Markdown",
+                         reply_markup=topics_keyboard("test", state.get('completed_topics', set())))
 
     elif text == "🎯 Мини-тест (случайный)":
         start_random_test(chat_id)
@@ -1803,12 +1835,16 @@ def handle_callback(call):
         bot.send_message(chat_id, "🏠 Главное меню", reply_markup=main_menu_keyboard())
 
     elif data == "choose_study":
+        state = get_state(chat_id)
         bot.send_message(chat_id, "📚 *Выбери тему для изучения:*",
-                         parse_mode="Markdown", reply_markup=topics_keyboard("study"))
+                         parse_mode="Markdown",
+                         reply_markup=topics_keyboard("study", state.get('completed_topics', set())))
 
     elif data == "choose_test":
+        state = get_state(chat_id)
         bot.send_message(chat_id, "🧪 *Выбери тему для теста:*",
-                         parse_mode="Markdown", reply_markup=topics_keyboard("test"))
+                         parse_mode="Markdown",
+                         reply_markup=topics_keyboard("test", state.get('completed_topics', set())))
 
     elif data.startswith("study:"):
         topic_key = data.split(":")[1]
@@ -1820,7 +1856,7 @@ def handle_callback(call):
 
     elif data.startswith("ans:"):
         _, ans_idx = data.split(":")
-        process_answer(chat_id, int(ans_idx), call.message)
+        process_answer(chat_id, int(ans_idx), call)
 
     elif data == "next_question":
         send_next_question(chat_id)
@@ -1863,21 +1899,25 @@ def start_topic_test(chat_id, topic_key):
     shuffled = questions.copy()
     random.shuffle(shuffled)
 
-    user_state[chat_id] = {
+    state = get_state(chat_id)
+    state.update({
         'mode': 'test',
         'topic': topic_key,
         'topic_name': topic_name,
         'questions': shuffled,
         'q_idx': 0,
         'score': 0,
-        'total': len(shuffled)
-    }
+        'total': len(shuffled),
+        'last_q_msg_id': None,
+        'last_ans_msg_id': None,
+    })
 
-    bot.send_message(chat_id,
+    intro = bot.send_message(chat_id,
                      f"🧪 *Тест: {topic_name}*\n"
                      f"Вопросов: {len(shuffled)}\n\n"
-                     f"Отвечай внимательно — объяснение будет после каждого ответа!",
+                     f"Отвечай внимательно — объяснение после каждого ответа!",
                      parse_mode="Markdown")
+    state['last_ans_msg_id'] = intro.message_id
     send_next_question(chat_id)
 
 def start_random_test(chat_id):
@@ -1891,26 +1931,30 @@ def start_random_test(chat_id):
 
     selected = random.sample(all_questions, min(8, len(all_questions)))
 
-    user_state[chat_id] = {
+    state = get_state(chat_id)
+    state.update({
         'mode': 'test',
         'topic': 'random',
         'topic_name': 'Случайный мини-тест',
         'questions': selected,
         'q_idx': 0,
         'score': 0,
-        'total': len(selected)
-    }
+        'total': len(selected),
+        'last_q_msg_id': None,
+        'last_ans_msg_id': None,
+    })
 
-    bot.send_message(chat_id,
+    intro = bot.send_message(chat_id,
                      f"🎯 *Случайный мини-тест*\n"
                      f"Вопросов: {len(selected)} (из разных тем)\n\n"
                      f"Начинаем! 🚀",
                      parse_mode="Markdown")
+    state['last_ans_msg_id'] = intro.message_id
     send_next_question(chat_id)
 
 def send_next_question(chat_id):
-    state = user_state.get(chat_id)
-    if not state or state.get('mode') != 'test':
+    state = get_state(chat_id)
+    if state.get('mode') != 'test':
         return
 
     q_idx = state['q_idx']
@@ -1920,38 +1964,44 @@ def send_next_question(chat_id):
         finish_test(chat_id)
         return
 
+    # Удаляем предыдущий вопрос и объяснение
+    safe_delete(chat_id, state.get('last_q_msg_id'))
+    safe_delete(chat_id, state.get('last_ans_msg_id'))
+    state['last_q_msg_id'] = None
+    state['last_ans_msg_id'] = None
+
     q = questions[q_idx]
     total = state['total']
-    progress = f"[{q_idx+1}/{total}]"
-
+    progress_bar = "▓" * (q_idx + 1) + "░" * (total - q_idx - 1)
     topic_hint = f"\n📌 _{q.get('topic_name', '')}_" if state['topic'] == 'random' else ""
-
-    text = f"❓ *Вопрос {progress}*{topic_hint}\n\n{q['question']}"
+    text = f"❓ *Вопрос {q_idx+1}/{total}*\n`{progress_bar}`{topic_hint}\n\n{q['question']}"
 
     markup = types.InlineKeyboardMarkup(row_width=1)
     for i, option in enumerate(q['options']):
         markup.add(types.InlineKeyboardButton(option, callback_data=f"ans:{i}"))
 
-    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
+    msg = bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
+    state['last_q_msg_id'] = msg.message_id
 
-def process_answer(chat_id, ans_idx, message):
-    state = user_state.get(chat_id)
-    if not state or state.get('mode') != 'test':
+def process_answer(chat_id, ans_idx, call):
+    state = get_state(chat_id)
+    if state.get('mode') != 'test':
         return
+
+    # Удаляем сообщение с вопросом сразу после ответа
+    safe_delete(chat_id, state.get('last_q_msg_id'))
+    state['last_q_msg_id'] = None
 
     q_idx = state['q_idx']
     q = state['questions'][q_idx]
     correct_idx = q['answer']
-
     is_correct = (ans_idx == correct_idx)
     if is_correct:
         state['score'] += 1
 
-    # Формируем ответ
     emoji = "✅" if is_correct else "❌"
     result_text = f"{emoji} *{'Верно!' if is_correct else 'Неверно!'}*\n\n"
 
-    # Показываем все варианты с маркировкой
     for i, option in enumerate(q['options']):
         if i == correct_idx:
             result_text += f"✅ {option}\n"
@@ -1960,7 +2010,7 @@ def process_answer(chat_id, ans_idx, message):
         else:
             result_text += f"○ {option}\n"
 
-    result_text += f"\n💡 *Объяснение:* {q['explanation']}"
+    result_text += f"\n💡 *Пояснение:* {q['explanation']}"
 
     state['q_idx'] += 1
     is_last = state['q_idx'] >= state['total']
@@ -1971,17 +2021,27 @@ def process_answer(chat_id, ans_idx, message):
     else:
         markup.add(types.InlineKeyboardButton("▶️ Следующий вопрос", callback_data="next_question"))
 
-    bot.send_message(chat_id, result_text, parse_mode="Markdown", reply_markup=markup)
+    msg = bot.send_message(chat_id, result_text, parse_mode="Markdown", reply_markup=markup)
+    state['last_ans_msg_id'] = msg.message_id
 
 def finish_test(chat_id):
-    state = user_state.get(chat_id)
-    if not state:
-        return
+    state = get_state(chat_id)
+
+    # Удаляем последние сообщения теста
+    safe_delete(chat_id, state.get('last_q_msg_id'))
+    safe_delete(chat_id, state.get('last_ans_msg_id'))
+    state['last_q_msg_id'] = None
+    state['last_ans_msg_id'] = None
 
     score = state.get('score', 0)
     total = state.get('total', 1)
+    topic_key = state.get('topic', '')
     topic_name = state.get('topic_name', 'Тест')
     percentage = round(score / total * 100)
+
+    # Отмечаем тему как пройденную при результате ≥ 60%
+    if percentage >= 60 and topic_key != 'random':
+        state.setdefault('completed_topics', set()).add(topic_key)
 
     if percentage >= 90:
         grade = "🏆 Отлично!"
@@ -1993,13 +2053,14 @@ def finish_test(chat_id):
         grade = "🥉 Удовлетворительно"
         comment = "Рекомендую ещё раз изучить материал."
     else:
-        grade = "📖 Нужно учиться!"
-        comment = "Обязательно прочитай теорию по этой теме."
+        grade = "📖 Нужно подучить!"
+        comment = "Прочитай теорию по этой теме и попробуй снова."
 
-    # Сохраняем результат
-    if 'results' not in user_state.get(chat_id, {}):
-        user_state[chat_id]['results'] = []
-    user_state[chat_id].setdefault('results', []).append({
+    completed_count = len(state.get('completed_topics', set()))
+    total_topics = len(TOPICS)
+    progress_line = f"📋 Пройдено тем: {completed_count}/{total_topics}"
+
+    state.setdefault('results', []).append({
         'topic': topic_name,
         'score': score,
         'total': total,
@@ -2010,24 +2071,26 @@ def finish_test(chat_id):
         f"📊 *Результаты теста*\n"
         f"📌 {topic_name}\n\n"
         f"{grade}\n"
-        f"✅ Правильных ответов: {score} из {total}\n"
-        f"📈 Процент: {percentage}%\n\n"
-        f"_{comment}_"
+        f"✅ Правильных: {score} из {total}\n"
+        f"📈 Результат: {percentage}%\n\n"
+        f"_{comment}_\n\n"
+        f"{progress_line}"
     )
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("🔄 Ещё раз", callback_data=f"test:{state.get('topic', 'random')}"),
+        types.InlineKeyboardButton("🔄 Ещё раз", callback_data=f"test:{topic_key}"),
         types.InlineKeyboardButton("🎯 Случайный тест", callback_data="random_test")
     )
     markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu"))
 
-    user_state[chat_id]['mode'] = 'idle'
+    state['mode'] = 'idle'
     bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
 
 def show_stats(chat_id):
-    state = user_state.get(chat_id, {})
+    state = get_state(chat_id)
     results = state.get('results', [])
+    completed = state.get('completed_topics', set())
 
     if not results:
         bot.send_message(
@@ -2038,14 +2101,14 @@ def show_stats(chat_id):
         )
         return
 
-    text = "📊 *Твои результаты:*\n\n"
+    text = f"📊 *Твои результаты:*\n📋 Пройдено тем: {len(completed)}/{len(TOPICS)}\n\n"
     total_correct = 0
     total_q = 0
 
-    for r in results[-10:]:  # последние 10
+    for r in results[-10:]:
         pct = r['pct']
         emoji = "🟢" if pct >= 75 else ("🟡" if pct >= 60 else "🔴")
-        text += f"{emoji} {r['topic'][:30]}: {r['score']}/{r['total']} ({pct}%)\n"
+        text += f"{emoji} {r['topic'][:28]}: {r['score']}/{r['total']} ({pct}%)\n"
         total_correct += r['score']
         total_q += r['total']
 
@@ -2060,5 +2123,5 @@ def show_stats(chat_id):
 if __name__ == "__main__":
     print("🤖 Бот по Статистике запущен!")
     print("📚 22 темы, тесты с объяснениями")
-    print("ПРИОСТАНОВЛЕН")
+    print("Для остановки нажмите Ctrl+C")
     bot.infinity_polling()
