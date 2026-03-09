@@ -2060,5 +2060,5 @@ def show_stats(chat_id):
 if __name__ == "__main__":
     print("🤖 Бот по Статистике запущен!")
     print("📚 22 темы, тесты с объяснениями")
-    print("Для остановки нажмите Ctrl+C")
+    print("ПРИОСТАНОВЛЕН")
     bot.infinity_polling()
